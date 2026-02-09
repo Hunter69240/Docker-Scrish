@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  backend:
+    build: ./scrish-backend-main/scrish-backend-main
+    ports:
+      - "5000:5000"
+
+  frontend:
+    build: ./scrish-frontend-main/scrish-frontend-main
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
