@@ -6,109 +6,133 @@ import soundfile as sf
 import io
 import base64
 import os
-from werkzeug.utils import secure_filename
 import uuid
+from pydub import AudioSegment
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# -------------------- CORS --------------------
-CORS(app, resources={
-    r"/api/*": {
-        "origins": ["*"],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"]
-    }
-})
-
-# -------------------- CONFIG --------------------
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
-app.config["UPLOAD_FOLDER"] = "/tmp"
-os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-
-# In-memory cache (use Redis in prod)
 audio_cache = {}
 
+
 # ======================================================
-# WINDOW-BASED FILTERS
+# MODULATION IMPLEMENTATIONS
 # ======================================================
+
+def apply_amplitude_modulation(signal, sr, depth):
+    """
+    depth: 0.1 – 1.0
+    Using 40Hz carrier so it is clearly audible
+    """
+    t = np.arange(len(signal)) / sr
+    carrier_freq = 40  # more audible than 5Hz
+    carrier = np.sin(2 * np.pi * carrier_freq * t)
+    modulated = signal * (1 + depth * carrier)
+    return np.clip(modulated, -1.0, 1.0)
+
+
+def apply_frequency_modulation(signal, sr, mod_freq):
+    """
+    Proper FM-style modulation
+    """
+    t = np.arange(len(signal)) / sr
+    beta = 5  # modulation index (controls intensity)
+
+    modulator = beta * np.sin(2 * np.pi * mod_freq * t)
+    modulated = np.sin(2 * np.pi * 440 * t + modulator)
+
+    # mix original + fm texture
+    mixed = 0.7 * signal + 0.3 * modulated
+    return np.clip(mixed, -1.0, 1.0)
+
+
+# ======================================================
+# UTILITIES
+# ======================================================
+
+def normalize_audio(signal, target_peak=0.9):
+    peak = np.max(np.abs(signal))
+    if peak < 1e-9:
+        return signal
+    return (signal / peak) * target_peak
+
 def hann_filter(data, window_size=1024):
-    window_size = max(16, int(window_size))
-    window = windows.hann(window_size, sym=False)
+    window = windows.hann(max(16, int(window_size)), sym=False)
     window /= np.sum(window)
     return np.convolve(data, window, mode="same")
 
 def blackman_filter(data, window_size=1024):
-    window_size = max(16, int(window_size))
-    window = windows.blackman(window_size, sym=False)
+    window = windows.blackman(max(16, int(window_size)), sym=False)
     window /= np.sum(window)
     return np.convolve(data, window, mode="same")
 
-# ======================================================
-# SAMPLE AUDIO GENERATORS
-# ======================================================
-def generate_noisy_signal(sr=44100, duration=3):
-    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
-    tone = np.sin(2 * np.pi * 440 * t)
-    noise = 0.4 * np.random.randn(len(t))
-    return tone + noise, sr
-
-def generate_sine_sweep(sr=44100, duration=4):
-    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
-    sweep = np.sin(2 * np.pi * (50 + 3000 * t / duration) * t)
-    return sweep, sr
-
-def generate_voice_like(sr=44100, duration=3):
-    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
-    signal = (
-        np.sin(2 * np.pi * 200 * t)
-        + 0.5 * np.sin(2 * np.pi * 400 * t)
-        + 0.3 * np.sin(2 * np.pi * 800 * t)
-    )
-    noise = 0.1 * np.random.randn(len(t))
-    return signal + noise, sr
+def add_random_noise(signal, noise_level=0.1):
+    signal_power = np.mean(signal ** 2)
+    noise = np.random.randn(len(signal))
+    noise_power = np.mean(noise ** 2)
+    scaled_noise = noise * np.sqrt(signal_power / noise_power)
+    noisy_signal = signal + noise_level * scaled_noise
+    return np.clip(noisy_signal, -1.0, 1.0)
 
 # ======================================================
-# FILTER DISPATCH
+# FILTER
 # ======================================================
+
 def filter_audio(data, sr, filter_type, freq1, freq2, order=4):
     nyq = 0.5 * sr
-    freq1_n = min(max(freq1 / nyq, 0.01), 0.99)
-    freq2_n = min(max(freq2 / nyq, freq1_n + 0.01), 0.99)
     order = max(1, min(int(order), 10))
 
+    low = min(freq1, freq2)
+    high = max(freq1, freq2)
+
+    low_n = np.clip(low / nyq, 0.01, 0.98)
+    high_n = np.clip(high / nyq, low_n + 0.01, 0.99)
+
     if filter_type == "lowpass":
-        b, a = butter(order, freq1_n, btype="low")
+        b, a = butter(order, low_n, btype="low")
         return lfilter(b, a, data)
 
     elif filter_type == "highpass":
-        b, a = butter(order, freq1_n, btype="high")
+        b, a = butter(order, low_n, btype="high")
         return lfilter(b, a, data)
 
     elif filter_type == "bandpass":
-        b, a = butter(order, [freq1_n, freq2_n], btype="band")
+        b, a = butter(order, [low_n, high_n], btype="band")
         return lfilter(b, a, data)
 
     elif filter_type == "hann":
-        return hann_filter(data, window_size=freq1)
+        return normalize_audio(hann_filter(data, freq1))
 
     elif filter_type == "blackman":
-        return blackman_filter(data, window_size=freq1)
+        return normalize_audio(blackman_filter(data, freq1))
 
     return data
 
 # ======================================================
-# UPLOAD AUDIO
+# ROUTES
 # ======================================================
+
 @app.route("/api/upload", methods=["POST"])
 def upload_audio():
-    if "audio" not in request.files:
+    file = request.files.get("audio")
+
+    if not file:
         return jsonify({"error": "No file uploaded"}), 400
 
-    file = request.files["audio"]
-    if not file.filename.lower().endswith(".wav"):
-        return jsonify({"error": "Only .wav files supported"}), 400
+    try:
+        # Convert webm -> wav using pydub
+        audio_segment = AudioSegment.from_file(file, format="webm")
 
-    audio_data, sr = sf.read(file)
+        wav_io = io.BytesIO()
+        audio_segment.export(wav_io, format="wav")
+        wav_io.seek(0)
+
+        audio_data, sr = sf.read(wav_io)
+
+    except Exception as e:
+        return jsonify({"error": f"Audio conversion failed: {str(e)}"}), 400
+
     if audio_data.ndim > 1:
         audio_data = audio_data.mean(axis=1)
 
@@ -118,88 +142,40 @@ def upload_audio():
     audio_cache[audio_id] = {
         "data": audio_data,
         "sample_rate": sr,
-        "duration": duration,
-        "filename": secure_filename(file.filename),
+        "duration": duration
     }
 
     return jsonify({
         "success": True,
         "audio_id": audio_id,
         "sample_rate": sr,
-        "duration": duration,
-        "samples": len(audio_data),
-        "filename": secure_filename(file.filename)
+        "duration": duration
     })
 
-# ======================================================
-# LOAD SAMPLE AUDIO (NO UPLOAD NEEDED)
-# ======================================================
-@app.route("/api/sample/<name>", methods=["GET"])
-def load_sample(name):
-    if name == "noisy":
-        audio_data, sr = generate_noisy_signal()
-    elif name == "voice_like":
-        audio_data, sr = generate_voice_like()
-    elif name == "sine_sweep":
-        audio_data, sr = generate_sine_sweep()
-    else:
-        return jsonify({"error": "Sample not found"}), 404
 
-    audio_id = str(uuid.uuid4())
-    duration = len(audio_data) / sr
-
-    audio_cache[audio_id] = {
-        "data": audio_data,
-        "sample_rate": sr,
-        "duration": duration,
-        "filename": f"{name}.wav",
-    }
-
-    return jsonify({
-        "success": True,
-        "audio_id": audio_id,
-        "sample_rate": sr,
-        "duration": duration,
-        "samples": len(audio_data),
-        "filename": f"{name}.wav",
-        "is_sample": True
-    })
-
-# ======================================================
-# PROCESS AUDIO
-# ======================================================
 @app.route("/api/process", methods=["POST"])
 def process_audio():
     data = request.json
-    audio_id = data.get("audio_id")
+    audio_id = data["audio_id"]
 
-    if audio_id not in audio_cache:
+    cached = audio_cache.get(audio_id)
+    if not cached:
         return jsonify({"error": "Audio not found"}), 404
 
-    cached = audio_cache[audio_id]
     audio = cached["data"]
     sr = cached["sample_rate"]
     duration = cached["duration"]
 
-    filter_type = data.get("filter_type", "none")
-    freq1 = float(data.get("freq1", 1024))
-    freq2 = float(data.get("freq2", 4000))
-    order = int(data.get("order", 4))
-    scope = data.get("filter_scope", "whole")
-    start_time = float(data.get("start_time", 0))
-    end_time = float(data.get("end_time", duration))
+    filtered = filter_audio(
+        audio,
+        sr,
+        data.get("filter_type", "lowpass"),
+        float(data.get("freq1", 1000)),
+        float(data.get("freq2", 4000)),
+        int(data.get("order", 4))
+    )
 
-    if scope == "segment":
-        start = int(start_time * sr)
-        end = int(end_time * sr)
-        input_audio = audio[start:end]
-        times = np.linspace(start_time, end_time, len(input_audio))
-    else:
-        input_audio = audio
-        times = np.linspace(0, duration, len(audio))
-
-    filtered = filter_audio(input_audio, sr, filter_type, freq1, freq2, order)
-
+    times = np.linspace(0, duration, len(audio))
     step = max(1, len(times) // 5000)
 
     def to_b64(signal):
@@ -210,19 +186,47 @@ def process_audio():
     return jsonify({
         "success": True,
         "times": times[::step].tolist(),
-        "original": input_audio[::step].tolist(),
+        "original": audio[::step].tolist(),
         "filtered": filtered[::step].tolist(),
-        "original_audio": to_b64(input_audio),
-        "filtered_audio": to_b64(filtered),
+        "original_audio": to_b64(audio),
+        "filtered_audio": to_b64(filtered)
+    })
+
+@app.route("/api/add-noise", methods=["POST"])
+def add_noise_endpoint():
+    data = request.json
+    audio_id = data["audio_id"]
+    noise_level = float(data.get("noise_level", 0.1))
+
+    cached = audio_cache.get(audio_id)
+    if not cached:
+        return jsonify({"error": "Audio not found"}), 404
+
+    audio = cached["data"]
+    sr = cached["sample_rate"]
+
+    noisy_audio = add_random_noise(audio, noise_level)
+
+    def to_b64(signal):
+        buf = io.BytesIO()
+        sf.write(buf, signal, sr, format="WAV")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    return jsonify({
+        "success": True,
+        "original_audio": to_b64(audio),
+        "noisy_audio": to_b64(noisy_audio)
     })
 
 # ======================================================
-# PROCESS WHOLE AUDIO
+# MODULATION ROUTE
 # ======================================================
-@app.route("/api/process-whole", methods=["POST"])
-def process_whole():
+
+@app.route("/api/modulate", methods=["POST"])
+def modulate_audio():
     data = request.json
     audio_id = data.get("audio_id")
+    modulation_type = data.get("modulation_type")
 
     if audio_id not in audio_cache:
         return jsonify({"error": "Audio not found"}), 404
@@ -230,41 +234,36 @@ def process_whole():
     cached = audio_cache[audio_id]
     audio = cached["data"]
     sr = cached["sample_rate"]
+    duration = cached["duration"]
 
-    filtered = filter_audio(
-        audio,
-        sr,
-        data.get("filter_type", "none"),
-        float(data.get("freq1", 1024)),
-        float(data.get("freq2", 4000)),
-        int(data.get("order", 4)),
-    )
+    if modulation_type == "am":
+        depth = float(data.get("depth", 0.5))
+        modulated = apply_amplitude_modulation(audio, sr, depth)
 
-    buf = io.BytesIO()
-    sf.write(buf, filtered, sr, format="WAV")
+    elif modulation_type == "fm":
+        freq = float(data.get("mod_freq", 1000))
+        modulated = apply_frequency_modulation(audio, sr, freq)
+
+    else:
+        return jsonify({"error": "Invalid modulation type"}), 400
+
+    # waveform sampling
+    times = np.linspace(0, duration, len(audio))
+    step = max(1, len(times) // 5000)
+
+    def to_b64(signal):
+        buf = io.BytesIO()
+        sf.write(buf, signal, sr, format="WAV")
+        return base64.b64encode(buf.getvalue()).decode()
 
     return jsonify({
         "success": True,
-        "whole_filtered_audio": base64.b64encode(buf.getvalue()).decode()
+        "times": times[::step].tolist(),
+        "original": audio[::step].tolist(),
+        "modulated": modulated[::step].tolist(),
+        "original_audio": to_b64(audio),
+        "modulated_audio": to_b64(modulated),
     })
 
-# ======================================================
-# HEALTH & ROOT
-# ======================================================
-@app.route("/api/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
-
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({
-        "message": "Scrish Audio Processing API",
-        "filters": ["lowpass", "highpass", "bandpass", "hann", "blackman"],
-        "samples": ["noisy", "voice_like", "sine_sweep"]
-    })
-
-# ======================================================
-# ENTRY
-# ======================================================
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=True)
